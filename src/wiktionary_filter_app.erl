@@ -2,7 +2,7 @@
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([init/2, terminate/3]).
+-export([handle/1]).
 
 %% Wiktionary API endpoint for French
 -define(DICT_URL, "https://fr.wiktionary.org/w/api.php?action=query&titles=").
@@ -19,32 +19,21 @@ start(_Type, _Args) ->
 %%----------------------------------------------------------------
 stop(_State) -> ok.
 
-%%----------------------------------------------------------------
-%% Cowboy init handler
-%%----------------------------------------------------------------
-init(Req0, State) ->
-    try
-        {ok, Body, Req} = cowboy_req:read_body(Req0),
-        io:format("Received JSON body: ~p~n", [Body]),
-        EmbryoList = safe_generate_embryo_list(Body),
-        ResponseJson = jsone:encode(#{embryo_list => EmbryoList}),
-        Req2 = cowboy_req:reply(200,
-                    #{<<"content-type">> => <<"application/json">>},
-                    ResponseJson,
-                    Req),
-        {ok, Req2, State}
-    catch
-        _:Error ->
-            io:format("Error in init: ~p~n", [Error]),
-            EmptyJson = jsone:encode(#{embryo_list => []}),
-            ReqErr = cowboy_req:reply(200,
-                         #{<<"content-type">> => <<"application/json">>},
-                         EmptyJson,
-                         Req0),
-            {ok, ReqErr, State}
-    end.
+%% @doc Handle incoming requests from the filter server.
+%% This function is called by em_filter_server through Wade.
+%% @param Body The request body (JSON binary or string)
+%% @return JSON response as binary or string
+handle(Body) when is_binary(Body) ->
+    handle(binary_to_list(Body));
 
-terminate(_Reason, _Req, _State) -> ok.
+handle(Body) when is_list(Body) ->
+    io:format("Bing Filter received body: ~p~n", [Body]),
+    EmbryoList = safe_generate_embryo_list(list_to_binary(Body)),
+    Response = #{embryo_list => EmbryoList},
+    jsone:encode(Response);
+
+handle(_) ->
+    jsone:encode(#{error => <<"Invalid request body">>}).
 
 %%----------------------------------------------------------------
 %% Safe JSON decode / embryo generator
