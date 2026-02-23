@@ -1,30 +1,63 @@
 %%%-------------------------------------------------------------------
-%%% @doc French Wiktionary definition filter.
+%%% @doc French Wiktionary definition agent.
 %%%
-%%% Fetches wiki markup for a word from the French Wiktionary API,
-%%% extracts definition lines and returns them as embryo maps.
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of definition URLs already returned, so
+%%%     duplicate definitions across successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(wiktionary_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(DICT_URL, "https://fr.wiktionary.org/w/api.php?action=query&titles=").
+
+-define(CAPABILITIES, [
+    <<"wiktionary">>,
+    <<"french">>,
+    <<"dictionary">>,
+    <<"definition">>,
+    <<"etymology">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_Type, _Args) ->
-    em_filter:start_filter(wiktionary_filter, ?MODULE).
+    em_filter:start_agent(wiktionary_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(wiktionary_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
+%%====================================================================
+
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — backward compatibility
 %%====================================================================
 
 handle(Body) when is_binary(Body) ->
@@ -33,7 +66,7 @@ handle(_) ->
     [].
 
 %%====================================================================
-%% Search and processing
+%% Search and processing (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -56,10 +89,6 @@ extract_params(JsonBinary) ->
         _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-%%--------------------------------------------------------------------
-%% HTTP fetch
-%%--------------------------------------------------------------------
-
 fetch_definitions("", _) -> [];
 fetch_definitions(Word, Timeout) ->
     Url = lists:flatten(io_lib:format(
@@ -75,10 +104,6 @@ fetch_definitions(Word, Timeout) ->
         _ ->
             []
     end.
-
-%%--------------------------------------------------------------------
-%% Definition extraction from wiki markup
-%%--------------------------------------------------------------------
 
 extract_definitions(Word, JsonBin) ->
     try json:decode(JsonBin) of
@@ -107,7 +132,6 @@ page_content(Page) ->
         _ -> <<"">>
     end.
 
-%% Keeps only "# definition" lines, skips "#:" notes and "#*" examples.
 extract_def_lines(Lines) ->
     lists:filtermap(fun(Line) ->
         Str = if is_binary(Line) -> binary_to_list(Line);
@@ -127,16 +151,12 @@ extract_def_lines(Lines) ->
     end, Lines).
 
 clean_wikicode(Line) ->
-    L1 = re:replace(Line, "\\{\\{[^\\}]+\\}\\}",              "",    [global, {return, list}]),
+    L1 = re:replace(Line, "\\{\\{[^\\}]+\\}\\}",               "",    [global, {return, list}]),
     L2 = re:replace(L1,   "\\[\\[([^\\]|]+)\\|([^\\]]+)\\]\\]", "\\2", [global, {return, list}]),
-    L3 = re:replace(L2,   "\\[\\[([^\\]]+)\\]\\]",            "\\1", [global, {return, list}]),
-    L4 = re:replace(L3,   "^#+\\s*",                           "",    [{return, list}]),
-    L5 = re:replace(L4,   "^[*:].*",                           "",    [global, {return, list}]),
+    L3 = re:replace(L2,   "\\[\\[([^\\]]+)\\]\\]",             "\\1", [global, {return, list}]),
+    L4 = re:replace(L3,   "^#+\\s*",                            "",    [{return, list}]),
+    L5 = re:replace(L4,   "^[*:].*",                            "",    [global, {return, list}]),
     string:trim(L5).
-
-%%--------------------------------------------------------------------
-%% Embryo construction
-%%--------------------------------------------------------------------
 
 build_embryos(_Word, [], Acc) ->
     lists:reverse(Acc);
@@ -154,3 +174,11 @@ build_embryos(Word, [Def | Rest], Acc) ->
         }
     },
     build_embryos(Word, Rest, [Embryo | Acc]).
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
